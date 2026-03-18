@@ -1,0 +1,894 @@
+
+## rm -rf /storage/hybrid_test_100_climate &&
+'''
+python /storage/peS2o_backup/hybrid_vectordb_json.py \
+build --input-dir /storage/data/new_samples --out-dir /storage/hybrid_test_100_climate \
+--max-docs 100 --climate-only --train-vecs 100 --nlist 8 \
+--nprobe 2 --embed-batch-size 20 --nbits 4
+'''
+
+import argparse, importlib.machinery, json, logging, math, os, pickle, re, sys, time, types
+from pathlib import Path
+from typing import Any
+
+import faiss
+import numpy as np
+from rank_bm25 import BM25Okapi
+import torch
+import torch.nn.functional as F
+
+os.environ.setdefault("TRANSFORMERS_NO_APEX", "1")
+os.environ.setdefault("TRANSFORMERS_NO_TRAINER", "1")
+
+if "apex" not in sys.modules:
+    apex_stub = types.ModuleType("apex")
+    apex_stub.amp = object()
+    apex_stub.__spec__ = importlib.machinery.ModuleSpec("apex", loader=None)
+    sys.modules["apex"] = apex_stub
+
+from sentence_transformers.SentenceTransformer import SentenceTransformer
+
+
+logger = logging.getLogger("hybrid_vectordb")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+CPU_THREADS = 40
+
+def configure_cpu_threads() -> None:
+    os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS)
+    os.environ["MKL_NUM_THREADS"] = str(CPU_THREADS)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(CPU_THREADS)
+    if hasattr(faiss, "omp_set_num_threads"):
+        faiss.omp_set_num_threads(CPU_THREADS)
+
+
+def split_sentences(text: str) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+    text = text.replace("\n", " ")
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def chunk_by_sentence_window(sentences: list[str], chunk_size: int) -> list[str]:
+    if not sentences:
+        return []
+
+    chunks: list[str] = []
+    start = 0
+    n_sentences = len(sentences)
+
+    while start < n_sentences:
+        end = start
+        current_len = 0
+        while end < n_sentences:
+            sentence = sentences[end]
+            projected = current_len + (1 if current_len else 0) + len(sentence)
+            if projected > chunk_size and end > start:
+                break
+            current_len = projected
+            end += 1
+            if current_len >= chunk_size:
+                break
+
+        chunk = " ".join(sentences[start:end]).strip()
+        if chunk:
+            chunks.append(chunk)
+
+        if end >= n_sentences:
+            break
+
+        start = end
+
+    return chunks
+
+
+def build_semantic_chunks(
+    text: str,
+    model: SentenceTransformer,
+    chunk_size: int,
+    overlap_words: int,
+    similarity_threshold: float,
+) -> list[str]:
+    sentences = split_sentences(text)
+    if not sentences:
+        return []
+    if len(sentences) == 1:
+        chunks = chunk_by_sentence_window(sentences, chunk_size=chunk_size)
+        return apply_word_overlap(chunks, overlap_words=overlap_words)
+
+    embeddings = model.encode(
+        sentences,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+        batch_size=min(256, len(sentences)),
+    )
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+
+    groups: list[list[str]] = []
+    current_group: list[str] = [sentences[0]]
+    for idx in range(1, len(sentences)):
+        similarity = float(np.dot(embeddings[idx - 1], embeddings[idx]))
+        if similarity < similarity_threshold and current_group:
+            groups.append(current_group)
+            current_group = [sentences[idx]]
+        else:
+            current_group.append(sentences[idx])
+
+    if current_group:
+        groups.append(current_group)
+
+    semantic_chunks: list[str] = []
+    for group in groups:
+        semantic_chunks.extend(
+            chunk_by_sentence_window(group, chunk_size=chunk_size)
+        )
+    return apply_word_overlap(semantic_chunks, overlap_words=overlap_words)
+
+
+def weighted_merge_chunks(
+    sentence_chunks: list[str],
+    semantic_chunks: list[str],
+    sentence_weight: float,
+    semantic_weight: float,
+) -> list[tuple[str, str, int]]:
+    sentence_weight = max(0.0, sentence_weight)
+    semantic_weight = max(0.0, semantic_weight)
+    if sentence_weight == 0.0 and semantic_weight == 0.0:
+        sentence_weight = 0.5
+        semantic_weight = 0.5
+
+    total = sentence_weight + semantic_weight
+    sentence_ratio = sentence_weight / total
+    semantic_ratio = semantic_weight / total
+
+    s_idx = 0
+    m_idx = 0
+    out: list[tuple[str, str, int]] = []
+    picked_sentence = 0
+    picked_semantic = 0
+
+    while s_idx < len(sentence_chunks) or m_idx < len(semantic_chunks):
+        choose_sentence = False
+        choose_semantic = False
+
+        if s_idx < len(sentence_chunks) and m_idx < len(semantic_chunks):
+            total_picked = max(1, picked_sentence + picked_semantic)
+            current_sentence_share = picked_sentence / total_picked
+            current_semantic_share = picked_semantic / total_picked
+            sentence_deficit = sentence_ratio - current_sentence_share
+            semantic_deficit = semantic_ratio - current_semantic_share
+            choose_sentence = sentence_deficit >= semantic_deficit
+            choose_semantic = not choose_sentence
+        elif s_idx < len(sentence_chunks):
+            choose_sentence = True
+        elif m_idx < len(semantic_chunks):
+            choose_semantic = True
+
+        if choose_sentence:
+            out.append((sentence_chunks[s_idx], "sentence", s_idx))
+            s_idx += 1
+            picked_sentence += 1
+        elif choose_semantic:
+            out.append((semantic_chunks[m_idx], "semantic", m_idx))
+            m_idx += 1
+            picked_semantic += 1
+
+    return out
+
+
+def tokenize(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+def apply_word_overlap(chunks: list[str], overlap_words: int) -> list[str]:
+    overlap_words = max(0, overlap_words)
+    if overlap_words == 0 or len(chunks) < 2:
+        return chunks
+
+    out = [chunks[0]]
+    prev_words = chunks[0].split()
+    for chunk in chunks[1:]:
+        overlap = prev_words[-overlap_words:] if prev_words else []
+        if overlap:
+            curr_words = chunk.split()
+            if len(curr_words) >= overlap_words and curr_words[:overlap_words] == overlap:
+                merged = chunk
+            else:
+                merged = " ".join(overlap + curr_words)
+            chunk = merged
+        out.append(chunk)
+        prev_words = chunk.split()
+    return out
+
+
+def normalize_chunk_text(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+
+
+def fisher_relevance_embedding(query_vec: np.ndarray, doc_vec: np.ndarray) -> float:
+    q_norm = float(np.linalg.norm(query_vec))
+    d_norm = float(np.linalg.norm(doc_vec))
+    denom = max(q_norm * d_norm, 1e-9)
+    dot = float(np.dot(query_vec, doc_vec))
+    term1 = query_vec / denom
+    term2 = (dot / max(denom * d_norm * d_norm, 1e-9)) * doc_vec
+    grad = term1 - term2
+    return float(np.dot(grad, grad))
+
+
+def result_filename_from_query(query: str) -> str:
+    words = re.findall(r"[a-z0-9]+", query.lower())
+    first_three = words[:3]
+    if not first_three:
+        return "result_query.json"
+    return f"result_{'_'.join(first_three)}.json"
+
+
+def unique_result_path(db_dir: Path, query: str) -> Path:
+    base_name = result_filename_from_query(query)
+    base_path = db_dir / base_name
+    if not base_path.exists():
+        return base_path
+
+    stem = base_path.stem
+    suffix = base_path.suffix
+    counter = 2
+    while True:
+        candidate = db_dir / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def iterate_jsonl(path: Path):
+    with path.open("r", encoding="utf-8") as file_obj:
+        for line_number, line in enumerate(file_obj, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield line_number, json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning("Skipping invalid JSON line %s", line_number)
+
+
+def list_json_files(input_dir: Path) -> list[Path]:
+    if not input_dir.exists():
+        raise FileNotFoundError(f"Input dir not found: {input_dir}")
+    files = sorted(input_dir.rglob("*.json"))
+    if not files:
+        raise FileNotFoundError(f"No .json files found under: {input_dir}")
+    return files
+
+
+def iterate_json_files(paths: list[Path]):
+    for path in paths:
+        with path.open("r", encoding="utf-8") as file_obj:
+            try:
+                data = json.load(file_obj)
+            except json.JSONDecodeError:
+                file_obj.seek(0)
+                for line_number, line in enumerate(file_obj, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield path, line_number, json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.warning("Skipping invalid JSON line %s in %s", line_number, path)
+                continue
+
+        if isinstance(data, list):
+            for idx, record in enumerate(data, start=1):
+                yield path, idx, record
+        else:
+            yield path, 1, data
+
+
+def extract_text(record: dict[str, Any]) -> str:
+    for key in ("text", "content", "body", "abstract", "introduction", "methodology", "discussion", "conclusion", "summary"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def choose_pq_m(dim: int, preferred: int = 64) -> int:
+    candidate = min(preferred, dim)
+    while candidate > 1:
+        if dim % candidate == 0:
+            return candidate
+        candidate -= 1
+    return 1
+
+
+def build_command(args: argparse.Namespace) -> None:
+    input_dir = Path(args.input_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    dense_index_path = out_dir / "dense_ivfpq.faiss"
+    sparse_index_path = out_dir / "sparse_bm25.pkl"
+    manifest_path = out_dir / "manifest.json"
+
+    configure_cpu_threads()
+
+    if args.cache_dir:
+        cache_dir = Path(args.cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["HF_HOME"] = str(cache_dir)
+        os.environ["HF_HUB_CACHE"] = str(cache_dir / "hub")
+
+    logger.info("Loading embedding model '%s' on device=cpu", args.embedding_model)
+    model = SentenceTransformer(args.embedding_model, device="cpu", cache_folder=args.cache_dir or None)
+
+    input_files = list_json_files(input_dir)
+    logger.info("[1/3] Chunking source .json with weighted sentence+semantic chunking")
+    t0 = time.time()
+    source_docs = 0
+    scanned_docs = 0
+    written_chunks = 0
+    skipped_duplicates = 0
+
+    logger.info("[2/3] Building dense FAISS IVF-PQ index")
+    train_target = max(1, args.train_vecs)
+    nlist = args.nlist
+
+    train_blocks: list[np.ndarray] = []
+    train_count = 0
+    index: faiss.IndexIVFPQ | None = None
+    indexed_count = 0
+    token_corpus: list[list[str]] = []
+    chunk_texts: list[str] = []
+    chunk_metadata: list[dict[str, Any]] = []
+    seen_chunks: set[str] = set()
+
+    batch_texts: list[str] = []
+
+    def process_batch(texts: list[str]) -> None:
+        nonlocal train_count, train_blocks, index, indexed_count
+        if not texts:
+            return
+        embeddings = model.encode(
+            texts,
+            batch_size=args.embed_batch_size,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+
+        if index is None:
+            train_blocks.append(embeddings)
+            train_count += embeddings.shape[0]
+            if train_count >= train_target:
+                train_matrix = np.concatenate(train_blocks, axis=0)[:train_target]
+                dim = int(train_matrix.shape[1])
+                pq_m = choose_pq_m(dim, preferred=args.pq_m)
+                quantizer = faiss.IndexFlatIP(dim)
+                index_cpu = faiss.IndexIVFPQ(quantizer, dim, nlist, pq_m, args.nbits, faiss.METRIC_INNER_PRODUCT)
+
+                index_cpu.train(train_matrix)
+                index = index_cpu
+                logger.info(
+                    "Trained IVF-PQ dim=%s nlist=%s m=%s nbits=%s train_vecs=%s",
+                    dim,
+                    nlist,
+                    pq_m,
+                    args.nbits,
+                    f"{train_target:,}",
+                )
+
+                for block in train_blocks:
+                    index.add(block)
+                    indexed_count += block.shape[0]
+                train_blocks = []
+        else:
+            index.add(embeddings)
+            indexed_count += embeddings.shape[0]
+
+    for file_path, _, record in iterate_json_files(input_files):
+        if not isinstance(record, dict):
+            continue
+        text = extract_text(record)
+        if not text:
+            continue
+
+        scanned_docs += 1
+
+        source_docs += 1
+        sentence_chunks = chunk_by_sentence_window(
+            split_sentences(text),
+            chunk_size=args.chunk_size,
+        )
+        sentence_chunks = apply_word_overlap(sentence_chunks, overlap_words=args.overlap_words)
+        semantic_chunks = build_semantic_chunks(
+            text,
+            model=model,
+            chunk_size=args.chunk_size,
+            overlap_words=args.overlap_words,
+            similarity_threshold=args.semantic_threshold,
+        )
+
+        merged_chunks = weighted_merge_chunks(
+            sentence_chunks=sentence_chunks,
+            semantic_chunks=semantic_chunks,
+            sentence_weight=args.sentence_chunk_weight,
+            semantic_weight=args.semantic_chunk_weight,
+        )
+
+        kept_chunks: list[str] = []
+        for chunk_text, _, _ in merged_chunks:
+            if not chunk_text:
+                continue
+            kept_chunks.append(chunk_text)
+
+        if not kept_chunks:
+            source_docs -= 1
+            continue
+
+        metadata = {
+            "title": record.get("title"),
+            "abstract": record.get("abstract"),
+        }
+
+        for chunk_text in kept_chunks:
+            normalized = normalize_chunk_text(chunk_text)
+            if normalized in seen_chunks:
+                skipped_duplicates += 1
+                continue
+            seen_chunks.add(normalized)
+            token_corpus.append(tokenize(chunk_text))
+            chunk_texts.append(chunk_text)
+            chunk_metadata.append(metadata)
+            batch_texts.append(chunk_text)
+            written_chunks += 1
+            if len(batch_texts) >= args.embed_batch_size:
+                process_batch(batch_texts)
+                batch_texts = []
+                if indexed_count and indexed_count % 500000 == 0:
+                    logger.info("embedded/indexed=%s", f"{indexed_count:,}")
+
+        if args.max_docs and source_docs >= args.max_docs:
+            logger.info("Reached max docs limit: %s", args.max_docs)
+            break
+
+        if source_docs % 10000 == 0:
+            logger.info(
+                "chunked docs=%s chunks=%s elapsed=%.1fm last_file=%s",
+                f"{source_docs:,}",
+                f"{written_chunks:,}",
+                (time.time() - t0) / 60,
+                file_path.name,
+            )
+
+    logger.info("Chunking complete: docs=%s chunks=%s", f"{source_docs:,}", f"{written_chunks:,}")
+
+    if batch_texts:
+        process_batch(batch_texts)
+
+    if index is None and train_blocks:
+        train_matrix = np.concatenate(train_blocks, axis=0)
+        dim = int(train_matrix.shape[1])
+        pq_m = choose_pq_m(dim, preferred=args.pq_m)
+        quantizer = faiss.IndexFlatIP(dim)
+        index = faiss.IndexIVFPQ(quantizer, dim, nlist, pq_m, args.nbits, faiss.METRIC_INNER_PRODUCT)
+        index.train(train_matrix)
+        index.add(train_matrix)
+        indexed_count = index.ntotal
+        train_target = int(train_matrix.shape[0])
+        logger.info(
+            "Trained IVF-PQ on available vectors dim=%s nlist=%s m=%s nbits=%s train_vecs=%s",
+            dim,
+            nlist,
+            pq_m,
+            args.nbits,
+            f"{train_target:,}",
+        )
+
+    if index is None:
+        raise RuntimeError("Not enough data to train IVF-PQ index.")
+
+    index.nprobe = args.nprobe
+    faiss.write_index(index, str(dense_index_path))
+
+    logger.info("Dense index complete: vectors=%s path=%s", f"{index.ntotal:,}", dense_index_path)
+
+    logger.info("[3/3] Building sparse BM25 index")
+    sparse_payload = {
+        "type": "bm25",
+        "token_corpus": token_corpus,
+        "chunk_texts": chunk_texts,
+        "chunk_metadata": chunk_metadata,
+    }
+    with sparse_index_path.open("wb") as file_obj:
+        pickle.dump(sparse_payload, file_obj, protocol=pickle.HIGHEST_PROTOCOL)
+
+    manifest = {
+        "input_dir": str(input_dir),
+        "input_files": len(input_files),
+        "output_dir": str(out_dir),
+        "embedding_model": args.embedding_model,
+        "chunk_size": args.chunk_size,
+        "semantic_threshold": args.semantic_threshold,
+        "overlap_words": args.overlap_words,
+        "sentence_chunk_weight": args.sentence_chunk_weight,
+        "semantic_chunk_weight": args.semantic_chunk_weight,
+        "index_type": "IndexIVFPQ",
+        "metric": "inner_product",
+        "nlist": args.nlist,
+        "nprobe": args.nprobe,
+        "train_vecs": train_target,
+        "nbits": args.nbits,
+        "documents_chunked": source_docs,
+        "documents_scanned": scanned_docs,
+        "chunks_count": written_chunks,
+        "skipped_duplicate_chunks": skipped_duplicates,
+        "dense_vectors": int(index.ntotal),
+        "elapsed_seconds": round(time.time() - t0, 2),
+        "max_docs": int(args.max_docs),
+        "files": {
+            "dense_faiss": str(dense_index_path),
+            "sparse_bm25": str(sparse_index_path),
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("Build complete. Manifest: %s", manifest_path)
+
+
+def normalize_scores(raw_scores: dict[int, float], higher_is_better: bool) -> dict[int, float]:
+    if not raw_scores:
+        return {}
+    values = np.asarray(list(raw_scores.values()), dtype=np.float32)
+    min_val = float(np.min(values))
+    max_val = float(np.max(values))
+    if math.isclose(max_val, min_val, rel_tol=0.0, abs_tol=1e-12):
+        return {key: 1.0 for key in raw_scores}
+    if higher_is_better:
+        return {key: (value - min_val) / (max_val - min_val) for key, value in raw_scores.items()}
+    return {key: (max_val - value) / (max_val - min_val) for key, value in raw_scores.items()}
+
+
+def search_command(args: argparse.Namespace) -> None:
+    db_dir = Path(args.db_dir)
+    dense_path = db_dir / "dense_ivfpq.faiss"
+    sparse_path = db_dir / "sparse_bm25.pkl"
+
+    if not dense_path.exists() or not sparse_path.exists():
+        raise FileNotFoundError("Missing DB files. Expected dense_ivfpq.faiss, sparse_bm25.pkl")
+
+    configure_cpu_threads()
+
+    index = faiss.read_index(str(dense_path))
+    index.nprobe = args.nprobe
+
+    with sparse_path.open("rb") as file_obj:
+        sparse_payload = pickle.load(file_obj)
+
+    token_corpus = sparse_payload.get("token_corpus", []) if isinstance(sparse_payload, dict) else []
+    chunk_texts = sparse_payload.get("chunk_texts", []) if isinstance(sparse_payload, dict) else []
+    chunk_metadata = sparse_payload.get("chunk_metadata", []) if isinstance(sparse_payload, dict) else []
+    bm25 = BM25Okapi(token_corpus)
+    chunk_count = min(int(index.ntotal), len(token_corpus), len(chunk_texts), len(chunk_metadata))
+    if chunk_count == 0:
+        raise RuntimeError("Empty index or token corpus. Rebuild the DB.")
+
+    if args.cache_dir:
+        cache_dir = Path(args.cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["HF_HOME"] = str(cache_dir)
+        os.environ["HF_HUB_CACHE"] = str(cache_dir / "hub")
+    model = SentenceTransformer(args.embedding_model, device="cpu", cache_folder=args.cache_dir or None)
+
+
+    def run_single_query(query_text: str) -> dict[str, Any]:
+        dense_raw: dict[int, float] = {}
+        sparse_raw: dict[int, float] = {}
+        dense_rank: dict[int, int] = {}
+        sparse_rank: dict[int, int] = {}
+        if args.fisher_rerank:
+            logger.info("Computing Fisher relevance in embedding space for all chunks")
+            query_vec_raw = model.encode(
+                [query_text],
+                normalize_embeddings=False,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            query_vec_raw = np.asarray(query_vec_raw[0], dtype=np.float32)
+            query_vec_norm = query_vec_raw / max(np.linalg.norm(query_vec_raw), 1e-9)
+
+            doc_vecs_raw = model.encode(
+                chunk_texts[:chunk_count],
+                normalize_embeddings=False,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+                batch_size=64,
+            )
+            doc_vecs_raw = np.asarray(doc_vecs_raw, dtype=np.float32)
+            doc_norms = np.linalg.norm(doc_vecs_raw, axis=1)
+            doc_norms = np.maximum(doc_norms, 1e-9)
+            doc_vecs_norm = doc_vecs_raw / doc_norms[:, None]
+
+            sparse_scores_arr = bm25.get_scores(tokenize(query_text))
+            for chunk_idx, score in enumerate(sparse_scores_arr[:chunk_count]):
+                sparse_raw[chunk_idx] = float(score)
+
+            dense_scores_arr = doc_vecs_norm @ query_vec_norm
+            fisher_scores = []
+            for idx in range(chunk_count):
+                dense_raw[idx] = float(dense_scores_arr[idx])
+                fisher_scores.append(
+                    fisher_relevance_embedding(query_vec_raw, doc_vecs_raw[idx])
+                )
+        else:
+            query_vec = model.encode(
+                [query_text],
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            query_vec = np.asarray(query_vec, dtype=np.float32)
+
+            dense_scores_arr, dense_ids_arr = index.search(query_vec, args.dense_top_k)
+            dense_scores_arr = dense_scores_arr[0]
+            dense_ids_arr = dense_ids_arr[0]
+
+            sparse_scores_arr = bm25.get_scores(tokenize(query_text))
+            sparse_ids = np.argsort(sparse_scores_arr)[::-1][: args.sparse_top_k]
+
+            for rank, chunk_idx in enumerate(dense_ids_arr, start=1):
+                chunk_idx = int(chunk_idx)
+                if chunk_idx < 0 or chunk_idx >= chunk_count:
+                    continue
+                dense_raw[chunk_idx] = float(dense_scores_arr[rank - 1])
+                dense_rank[chunk_idx] = rank
+
+            for rank, chunk_idx in enumerate(sparse_ids, start=1):
+                chunk_idx = int(chunk_idx)
+                if chunk_idx < 0 or chunk_idx >= chunk_count:
+                    continue
+                sparse_raw[chunk_idx] = float(sparse_scores_arr[chunk_idx])
+                sparse_rank[chunk_idx] = rank
+
+        dense_norm = normalize_scores(dense_raw, higher_is_better=True)
+        sparse_norm = normalize_scores(sparse_raw, higher_is_better=True)
+
+        dense_weight = max(0.0, args.dense_weight)
+        sparse_weight = max(0.0, args.sparse_weight)
+        weight_sum = dense_weight + sparse_weight
+        if weight_sum == 0.0:
+            dense_weight = sparse_weight = 0.5
+            weight_sum = 1.0
+
+        candidates = list(set(dense_raw.keys()) | set(sparse_raw.keys()))
+        rescored: list[dict[str, Any]] = []
+        for chunk_idx in candidates:
+            hybrid = (
+                dense_weight * dense_norm.get(chunk_idx, 0.0)
+                + sparse_weight * sparse_norm.get(chunk_idx, 0.0)
+            ) / weight_sum
+            if args.fisher_rerank:
+                final_score = float(fisher_scores[chunk_idx])
+            elif chunk_idx in dense_raw:
+                final_score = dense_raw.get(chunk_idx)
+            else:
+                final_score = sparse_raw.get(chunk_idx, 0.0)
+            rescored.append(
+                {
+                    "chunk_idx": chunk_idx,
+                    "text": chunk_texts[chunk_idx],
+                    "metadata": chunk_metadata[chunk_idx],
+                    "scores": {
+                        "dense_raw": dense_raw.get(chunk_idx),
+                        "dense_rank": dense_rank.get(chunk_idx),
+                        "sparse_raw": sparse_raw.get(chunk_idx),
+                        "sparse_rank": sparse_rank.get(chunk_idx),
+                        "dense_norm": dense_norm.get(chunk_idx, 0.0),
+                        "sparse_norm": sparse_norm.get(chunk_idx, 0.0),
+                        "hybrid_norm": hybrid,
+                        "dense_weight": dense_weight,
+                        "sparse_weight": sparse_weight,
+                        "final_score": final_score,
+                    },
+                }
+            )
+
+        deduped: dict[str, dict[str, Any]] = {}
+        for item in rescored:
+            text = item.get("text", "")
+            key = normalize_chunk_text(text)
+            if not key:
+                continue
+            existing = deduped.get(key)
+            if existing is None or item["scores"]["final_score"] > existing["scores"]["final_score"]:
+                deduped[key] = item
+
+        rescored = sorted(deduped.values(), key=lambda item: item["scores"]["final_score"], reverse=True)
+
+        rescored = sorted(rescored, key=lambda item: item["scores"]["final_score"], reverse=True)
+
+        output_top_k = max(args.final_top_k, 20)
+        rescored = rescored[:output_top_k]
+
+        return {
+            "query": query_text,
+            "embedding_model": args.embedding_model,
+            "retrieve": {
+                "dense_top_k": args.dense_top_k,
+                "sparse_top_k": args.sparse_top_k,
+                "final_top_k": args.final_top_k,
+                "nprobe": args.nprobe,
+                "dense_weight": dense_weight,
+                "sparse_weight": sparse_weight,
+            },
+            "results": rescored,
+        }
+
+    query_list: list[str] = []
+    if args.queries_file:
+        q_path = Path(args.queries_file)
+        if not q_path.exists():
+            raise FileNotFoundError(f"Queries file not found: {q_path}")
+        with q_path.open("r", encoding="utf-8") as file_obj:
+            for line in file_obj:
+                q = line.strip()
+                if q:
+                    query_list.append(q)
+
+    if args.queries:
+        query_list.extend([q.strip() for q in args.queries if q.strip()])
+
+    if args.query and args.query.strip():
+        query_list.append(args.query.strip())
+
+    if args.interactive:
+        print("Interactive mode: enter queries one per line. Type 'exit' to stop.")
+        while True:
+            user_query = input("query> ").strip()
+            if not user_query:
+                continue
+            if user_query.lower() in {"exit", "quit", "q"}:
+                break
+            result = run_single_query(user_query)
+            result_file = unique_result_path(db_dir, user_query)
+            result_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info("Saved search result: %s", result_file)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if not query_list:
+        raise ValueError("Provide at least one query via --query, --queries, --queries-file, or use --interactive")
+
+    for query_text in query_list:
+        result = run_single_query(query_text)
+        result_file = unique_result_path(db_dir, query_text)
+        result_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("Saved search result: %s", result_file)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build and query a weighted sentence+semantic hybrid vector DB over prebuilt chunks JSONL."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    build = subparsers.add_parser("build", help="Build chunked corpus + dense/sparse indexes")
+    build.add_argument("--input-dir", type=str, default="/storage/data/new_samples")
+    build.add_argument("--out-dir", type=str, required=True)
+    build.add_argument("--embedding-model", type=str, default="Qwen/Qwen3-Embedding-0.6B")
+    build.add_argument("--chunk-size", type=int, default=256)
+    build.add_argument("--overlap-words", type=int, default=3)
+    build.add_argument("--semantic-threshold", type=float, default=0.85)
+    build.add_argument("--sentence-chunk-weight", type=float, default=0.5)
+    build.add_argument("--semantic-chunk-weight", type=float, default=0.5)
+    build.add_argument("--embed-batch-size", type=int, default=64)
+    build.add_argument("--nlist", type=int, default=256)
+    build.add_argument("--nprobe", type=int, default=32)
+    build.add_argument("--pq-m", type=int, default=64)
+    build.add_argument("--nbits", type=int, default=8)
+    build.add_argument("--train-vecs", type=int, default=20000)
+    build.add_argument("--max-docs", type=int, default=0)
+    build.add_argument("--cache-dir", type=str, default="/storage/.cache/huggingface")
+
+    search = subparsers.add_parser("search", help="Search built DB and return top fused chunks")
+    search.add_argument("--db-dir", type=str, required=True)
+    search.add_argument("--query", type=str, default="")
+    search.add_argument("--queries", type=str, nargs="+")
+    search.add_argument("--queries-file", type=str, default="")
+    search.add_argument("--interactive", action="store_true")
+    search.add_argument("--embedding-model", type=str, default="Qwen/Qwen3-Embedding-0.6B")
+    search.add_argument("--dense-top-k", type=int, default=5)
+    search.add_argument("--sparse-top-k", type=int, default=5)
+    search.add_argument("--final-top-k", type=int, default=5)
+    search.add_argument("--nprobe", type=int, default=32)
+    search.add_argument("--dense-weight", type=float, default=0.5)
+    search.add_argument("--sparse-weight", type=float, default=0.5)
+    search.add_argument("--fisher-rerank", action="store_true")
+    search.add_argument("--fisher-top-k", type=int, default=20)
+    search.add_argument("--cache-dir", type=str, default="/storage/.cache/huggingface")
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.command == "build":
+        build_command(args)
+    elif args.command == "search":
+        search_command(args)
+    else:
+        raise ValueError(f"Unknown command: {args.command}")
+
+
+if __name__ == "__main__":
+    s = time.time()
+    main()
+    print(f"Total elapsed time: {(time.time() - s) / 60:.2f} minutes")
+
+
+"""
+How to use
+==========
+
+1) Build a vector DB from .json files
+
+python3 hybrid_vectordb_json.py build \
+    --input-dir /storage/data/new_samples \
+    --out-dir /path/to/output_db \
+    --embedding-model Qwen/Qwen3-Embedding-0.6B \
+    --chunk-size 256 \
+    --semantic-threshold 0.85 \
+    --overlap-words 3 \
+    --sentence-chunk-weight 0.5 \
+    --semantic-chunk-weight 0.5 \
+    --nlist 256 \
+    --nprobe 32
+
+Build outputs include models + configuration only:
+- dense_ivfpq.faiss
+- sparse_bm25.pkl
+- manifest.json
+
+2) Search with a query
+
+python3 hybrid_vectordb_json.py search \
+    --db-dir /path/to/output_db \
+    --query "what impacts climate crisis the most?" \
+    --embedding-model Qwen/Qwen3-Embedding-0.6B \
+    --dense-top-k 5 \
+    --sparse-top-k 5 \
+    --final-top-k 5 \
+    --nprobe 32 \
+    --dense-weight 0.5 \
+    --sparse-weight 0.5
+
+Search prints JSON to stdout and also saves:
+- result_{first_three_words}.json (in --db-dir)
+
+3) Search multiple queries continuously
+
+Batch queries from CLI:
+
+python3 hybrid_vectordb.py search \
+    --db-dir /path/to/output_db \
+    --queries "what impacts climate crisis the most?" "what are top mitigation options?" \
+    --embedding-model Qwen/Qwen3-Embedding-0.6B
+
+Batch queries from file (one query per line):
+
+python3 hybrid_vectordb.py search \
+    --db-dir /path/to/output_db \
+    --queries-file /path/to/queries.txt \
+    --embedding-model Qwen/Qwen3-Embedding-0.6B
+
+Interactive continuous mode (type 'exit' to stop):
+
+python3 hybrid_vectordb.py search \
+    --db-dir /path/to/output_db \
+    --interactive \
+    --embedding-model Qwen/Qwen3-Embedding-0.6B
+"""
