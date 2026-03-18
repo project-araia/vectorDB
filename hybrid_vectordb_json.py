@@ -1,4 +1,5 @@
 
+
 import argparse, importlib.machinery, json, logging, math, os, pickle, re, sys, time, types
 from pathlib import Path
 from typing import Any
@@ -6,8 +7,6 @@ from typing import Any
 import faiss
 import numpy as np
 from rank_bm25 import BM25Okapi
-import torch
-import torch.nn.functional as F
 
 os.environ.setdefault("TRANSFORMERS_NO_APEX", "1")
 os.environ.setdefault("TRANSFORMERS_NO_TRAINER", "1")
@@ -24,6 +23,8 @@ from sentence_transformers.SentenceTransformer import SentenceTransformer
 logger = logging.getLogger("hybrid_vectordb")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 CPU_THREADS = 40
+
+# Deduplication threshold for build phase: chunks with embedding similarity >= 0.7 are considered duplicates
 EMBEDDING_DEDUP_THRESHOLD = 0.7
 
 def configure_cpu_threads() -> None:
@@ -198,62 +199,6 @@ def apply_word_overlap(chunks: list[str], overlap_words: int) -> list[str]:
 def normalize_chunk_text(text: str) -> str:
     return " ".join(text.lower().split())
 
-
-def deduplicate_scored_items(
-    items: list[dict[str, Any]],
-    model: SentenceTransformer,
-    similarity_threshold: float = EMBEDDING_DEDUP_THRESHOLD,
-) -> list[dict[str, Any]]:
-    if not items:
-        return []
-
-    deduped: list[dict[str, Any]] = []
-    seen_texts: set[str] = set()
-    embedding_index: faiss.IndexFlatIP | None = None
-
-    texts = [item.get("text", "") for item in items]
-    embeddings = model.encode(
-        texts,
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-        show_progress_bar=False,
-        batch_size=min(256, max(1, len(texts))),
-    )
-    embeddings = np.asarray(embeddings, dtype=np.float32)
-
-    for item, embedding in zip(items, embeddings):
-        text = item.get("text", "")
-        key = normalize_chunk_text(text)
-        if not key or key in seen_texts:
-            continue
-
-        if embedding_index is None:
-            embedding_index = faiss.IndexFlatIP(int(embedding.shape[0]))
-        elif embedding_index.ntotal > 0:
-            scores, _ = embedding_index.search(embedding[None, :], 1)
-            if float(scores[0][0]) >= similarity_threshold:
-                continue
-
-        seen_texts.add(key)
-        embedding_index.add(embedding[None, :])
-        deduped.append(item)
-
-    return deduped
-
-
-
-
-def fisher_relevance_embedding(query_vec: np.ndarray, doc_vec: np.ndarray) -> float:
-    q_norm = float(np.linalg.norm(query_vec))
-    d_norm = float(np.linalg.norm(doc_vec))
-    denom = max(q_norm * d_norm, 1e-9)
-    dot = float(np.dot(query_vec, doc_vec))
-    term1 = query_vec / denom
-    term2 = (dot / max(denom * d_norm * d_norm, 1e-9)) * doc_vec
-    grad = term1 - term2
-    return float(np.dot(grad, grad))
-
-
 def result_filename_from_query(query: str) -> str:
     words = re.findall(r"[a-z0-9]+", query.lower())
     first_three = words[:3]
@@ -341,6 +286,18 @@ def choose_pq_m(dim: int, preferred: int = 64) -> int:
 
 
 def build_command(args: argparse.Namespace) -> None:
+    """
+    Build hybrid vector database with dual-mechanism deduplication.
+
+    Process:
+      1. Chunk JSON documents with weighted sentence+semantic chunking
+      2. Apply mandatory dual-mechanism deduplication:
+         - Text normalization matching
+         - Embedding-based similarity (threshold 0.7)
+      3. Build dense FAISS IVF-PQ index from chunk embeddings
+      4. Build sparse BM25 index from tokenized chunks
+      5. Save indexes + metadata to output directory
+    """
     input_dir = Path(args.input_dir)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -609,6 +566,21 @@ def normalize_scores(raw_scores: dict[int, float], higher_is_better: bool) -> di
 
 
 def search_command(args: argparse.Namespace) -> None:
+    """
+    Search hybrid vector database using dual-path retrieval.
+
+    Process:
+      1. Load pre-built dense (FAISS) and sparse (BM25) indexes
+      2. Encode query with SentenceTransformer
+      3. Retrieve candidates from both indexes:
+         - Dense path: Top-k semantically similar chunks (cosine similarity)
+         - Sparse path: Top-k keyword-relevant chunks (BM25 scores)
+      4. Normalize and fuse scores with configurable weights
+      5. Return top-k ranked chunks by hybrid score
+
+    Note: No Fisher reranking or post-search deduplication applied.
+            Use EMBEDDING_DEDUP_THRESHOLD only during build phase.
+    """
     db_dir = Path(args.db_dir)
     dense_path = db_dir / "dense_ivfpq.faiss"
     sparse_path = db_dir / "sparse_bm25.pkl"
@@ -645,69 +617,35 @@ def search_command(args: argparse.Namespace) -> None:
         sparse_raw: dict[int, float] = {}
         dense_rank: dict[int, int] = {}
         sparse_rank: dict[int, int] = {}
-        if args.fisher_rerank:
-            logger.info("Computing Fisher relevance in embedding space for all chunks")
-            query_vec_raw = model.encode(
-                [query_text],
-                normalize_embeddings=False,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-            )
-            query_vec_raw = np.asarray(query_vec_raw[0], dtype=np.float32)
-            query_vec_norm = query_vec_raw / max(np.linalg.norm(query_vec_raw), 1e-9)
 
-            doc_vecs_raw = model.encode(
-                chunk_texts[:chunk_count],
-                normalize_embeddings=False,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-                batch_size=64,
-            )
-            doc_vecs_raw = np.asarray(doc_vecs_raw, dtype=np.float32)
-            doc_norms = np.linalg.norm(doc_vecs_raw, axis=1)
-            doc_norms = np.maximum(doc_norms, 1e-9)
-            doc_vecs_norm = doc_vecs_raw / doc_norms[:, None]
+        query_vec = model.encode(
+            [query_text],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        query_vec = np.asarray(query_vec, dtype=np.float32)
 
-            sparse_scores_arr = bm25.get_scores(tokenize(query_text))
-            for chunk_idx, score in enumerate(sparse_scores_arr[:chunk_count]):
-                sparse_raw[chunk_idx] = float(score)
+        dense_scores_arr, dense_ids_arr = index.search(query_vec, args.dense_top_k)
+        dense_scores_arr = dense_scores_arr[0]
+        dense_ids_arr = dense_ids_arr[0]
 
-            dense_scores_arr = doc_vecs_norm @ query_vec_norm
-            fisher_scores = []
-            for idx in range(chunk_count):
-                dense_raw[idx] = float(dense_scores_arr[idx])
-                fisher_scores.append(
-                    fisher_relevance_embedding(query_vec_raw, doc_vecs_raw[idx])
-                )
-        else:
-            query_vec = model.encode(
-                [query_text],
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-            )
-            query_vec = np.asarray(query_vec, dtype=np.float32)
+        sparse_scores_arr = bm25.get_scores(tokenize(query_text))
+        sparse_ids = np.argsort(sparse_scores_arr)[::-1][: args.sparse_top_k]
 
-            dense_scores_arr, dense_ids_arr = index.search(query_vec, args.dense_top_k)
-            dense_scores_arr = dense_scores_arr[0]
-            dense_ids_arr = dense_ids_arr[0]
+        for rank, chunk_idx in enumerate(dense_ids_arr, start=1):
+            chunk_idx = int(chunk_idx)
+            if chunk_idx < 0 or chunk_idx >= chunk_count:
+                continue
+            dense_raw[chunk_idx] = float(dense_scores_arr[rank - 1])
+            dense_rank[chunk_idx] = rank
 
-            sparse_scores_arr = bm25.get_scores(tokenize(query_text))
-            sparse_ids = np.argsort(sparse_scores_arr)[::-1][: args.sparse_top_k]
-
-            for rank, chunk_idx in enumerate(dense_ids_arr, start=1):
-                chunk_idx = int(chunk_idx)
-                if chunk_idx < 0 or chunk_idx >= chunk_count:
-                    continue
-                dense_raw[chunk_idx] = float(dense_scores_arr[rank - 1])
-                dense_rank[chunk_idx] = rank
-
-            for rank, chunk_idx in enumerate(sparse_ids, start=1):
-                chunk_idx = int(chunk_idx)
-                if chunk_idx < 0 or chunk_idx >= chunk_count:
-                    continue
-                sparse_raw[chunk_idx] = float(sparse_scores_arr[chunk_idx])
-                sparse_rank[chunk_idx] = rank
+        for rank, chunk_idx in enumerate(sparse_ids, start=1):
+            chunk_idx = int(chunk_idx)
+            if chunk_idx < 0 or chunk_idx >= chunk_count:
+                continue
+            sparse_raw[chunk_idx] = float(sparse_scores_arr[chunk_idx])
+            sparse_rank[chunk_idx] = rank
 
         dense_norm = normalize_scores(dense_raw, higher_is_better=True)
         sparse_norm = normalize_scores(sparse_raw, higher_is_better=True)
@@ -726,9 +664,7 @@ def search_command(args: argparse.Namespace) -> None:
                 dense_weight * dense_norm.get(chunk_idx, 0.0)
                 + sparse_weight * sparse_norm.get(chunk_idx, 0.0)
             ) / weight_sum
-            if args.fisher_rerank:
-                final_score = float(fisher_scores[chunk_idx])
-            elif chunk_idx in dense_raw:
+            if chunk_idx in dense_raw:
                 final_score = dense_raw.get(chunk_idx)
             else:
                 final_score = sparse_raw.get(chunk_idx, 0.0)
@@ -752,8 +688,6 @@ def search_command(args: argparse.Namespace) -> None:
                 }
             )
 
-        rescored = sorted(rescored, key=lambda item: item["scores"]["final_score"], reverse=True)
-        rescored = deduplicate_scored_items(rescored, model=model)
         rescored = sorted(rescored, key=lambda item: item["scores"]["final_score"], reverse=True)
 
         output_top_k = max(args.final_top_k, 20)
@@ -853,8 +787,6 @@ def parse_args() -> argparse.Namespace:
     search.add_argument("--nprobe", type=int, default=32)
     search.add_argument("--dense-weight", type=float, default=0.5)
     search.add_argument("--sparse-weight", type=float, default=0.5)
-    search.add_argument("--fisher-rerank", action="store_true")
-    search.add_argument("--fisher-top-k", type=int, default=20)
     search.add_argument("--cache-dir", type=str, default="/storage/.cache/huggingface")
 
     return parser.parse_args()
