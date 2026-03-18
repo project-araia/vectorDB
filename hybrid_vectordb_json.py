@@ -1,12 +1,4 @@
 
-## rm -rf /storage/hybrid_test_100_climate &&
-'''
-python /storage/peS2o_backup/hybrid_vectordb_json.py \
-build --input-dir /storage/data/new_samples --out-dir /storage/hybrid_test_100_climate \
---max-docs 100 --climate-only --train-vecs 100 --nlist 8 \
---nprobe 2 --embed-batch-size 20 --nbits 4
-'''
-
 import argparse, importlib.machinery, json, logging, math, os, pickle, re, sys, time, types
 from pathlib import Path
 from typing import Any
@@ -32,6 +24,7 @@ from sentence_transformers.SentenceTransformer import SentenceTransformer
 logger = logging.getLogger("hybrid_vectordb")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 CPU_THREADS = 40
+EMBEDDING_DEDUP_THRESHOLD = 0.7
 
 def configure_cpu_threads() -> None:
     os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS)
@@ -206,6 +199,48 @@ def normalize_chunk_text(text: str) -> str:
     return " ".join(text.lower().split())
 
 
+def deduplicate_scored_items(
+    items: list[dict[str, Any]],
+    model: SentenceTransformer,
+    similarity_threshold: float = EMBEDDING_DEDUP_THRESHOLD,
+) -> list[dict[str, Any]]:
+    if not items:
+        return []
+
+    deduped: list[dict[str, Any]] = []
+    seen_texts: set[str] = set()
+    embedding_index: faiss.IndexFlatIP | None = None
+
+    texts = [item.get("text", "") for item in items]
+    embeddings = model.encode(
+        texts,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+        batch_size=min(256, max(1, len(texts))),
+    )
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+
+    for item, embedding in zip(items, embeddings):
+        text = item.get("text", "")
+        key = normalize_chunk_text(text)
+        if not key or key in seen_texts:
+            continue
+
+        if embedding_index is None:
+            embedding_index = faiss.IndexFlatIP(int(embedding.shape[0]))
+        elif embedding_index.ntotal > 0:
+            scores, _ = embedding_index.search(embedding[None, :], 1)
+            if float(scores[0][0]) >= similarity_threshold:
+                continue
+
+        seen_texts.add(key)
+        embedding_index.add(embedding[None, :])
+        deduped.append(item)
+
+    return deduped
+
+
 
 
 def fisher_relevance_embedding(query_vec: np.ndarray, doc_vec: np.ndarray) -> float:
@@ -345,13 +380,15 @@ def build_command(args: argparse.Namespace) -> None:
     chunk_texts: list[str] = []
     chunk_metadata: list[dict[str, Any]] = []
     seen_chunks: set[str] = set()
+    dedup_index: faiss.IndexFlatIP | None = None
 
-    batch_texts: list[str] = []
+    batch_items: list[tuple[str, dict[str, Any]]] = []
 
-    def process_batch(texts: list[str]) -> None:
-        nonlocal train_count, train_blocks, index, indexed_count
-        if not texts:
+    def process_batch(items: list[tuple[str, dict[str, Any]]]) -> None:
+        nonlocal train_count, train_blocks, index, indexed_count, dedup_index, skipped_duplicates, written_chunks
+        if not items:
             return
+        texts = [text for text, _ in items]
         embeddings = model.encode(
             texts,
             batch_size=args.embed_batch_size,
@@ -360,6 +397,34 @@ def build_command(args: argparse.Namespace) -> None:
             show_progress_bar=False,
         )
         embeddings = np.asarray(embeddings, dtype=np.float32)
+
+        kept_embeddings: list[np.ndarray] = []
+        for (chunk_text, metadata), embedding in zip(items, embeddings):
+            normalized = normalize_chunk_text(chunk_text)
+            if normalized in seen_chunks:
+                skipped_duplicates += 1
+                continue
+
+            if dedup_index is None:
+                dedup_index = faiss.IndexFlatIP(int(embedding.shape[0]))
+            elif dedup_index.ntotal > 0:
+                scores, _ = dedup_index.search(embedding[None, :], 1)
+                if float(scores[0][0]) >= EMBEDDING_DEDUP_THRESHOLD:
+                    skipped_duplicates += 1
+                    continue
+
+            seen_chunks.add(normalized)
+            dedup_index.add(embedding[None, :])
+            token_corpus.append(tokenize(chunk_text))
+            chunk_texts.append(chunk_text)
+            chunk_metadata.append(metadata)
+            kept_embeddings.append(embedding)
+            written_chunks += 1
+
+        if not kept_embeddings:
+            return
+
+        embeddings = np.asarray(kept_embeddings, dtype=np.float32)
 
         if index is None:
             train_blocks.append(embeddings)
@@ -436,19 +501,10 @@ def build_command(args: argparse.Namespace) -> None:
         }
 
         for chunk_text in kept_chunks:
-            normalized = normalize_chunk_text(chunk_text)
-            if normalized in seen_chunks:
-                skipped_duplicates += 1
-                continue
-            seen_chunks.add(normalized)
-            token_corpus.append(tokenize(chunk_text))
-            chunk_texts.append(chunk_text)
-            chunk_metadata.append(metadata)
-            batch_texts.append(chunk_text)
-            written_chunks += 1
-            if len(batch_texts) >= args.embed_batch_size:
-                process_batch(batch_texts)
-                batch_texts = []
+            batch_items.append((chunk_text, metadata))
+            if len(batch_items) >= args.embed_batch_size:
+                process_batch(batch_items)
+                batch_items = []
                 if indexed_count and indexed_count % 500000 == 0:
                     logger.info("embedded/indexed=%s", f"{indexed_count:,}")
 
@@ -467,8 +523,8 @@ def build_command(args: argparse.Namespace) -> None:
 
     logger.info("Chunking complete: docs=%s chunks=%s", f"{source_docs:,}", f"{written_chunks:,}")
 
-    if batch_texts:
-        process_batch(batch_texts)
+    if batch_items:
+        process_batch(batch_items)
 
     if index is None and train_blocks:
         train_matrix = np.concatenate(train_blocks, axis=0)
@@ -696,18 +752,8 @@ def search_command(args: argparse.Namespace) -> None:
                 }
             )
 
-        deduped: dict[str, dict[str, Any]] = {}
-        for item in rescored:
-            text = item.get("text", "")
-            key = normalize_chunk_text(text)
-            if not key:
-                continue
-            existing = deduped.get(key)
-            if existing is None or item["scores"]["final_score"] > existing["scores"]["final_score"]:
-                deduped[key] = item
-
-        rescored = sorted(deduped.values(), key=lambda item: item["scores"]["final_score"], reverse=True)
-
+        rescored = sorted(rescored, key=lambda item: item["scores"]["final_score"], reverse=True)
+        rescored = deduplicate_scored_items(rescored, model=model)
         rescored = sorted(rescored, key=lambda item: item["scores"]["final_score"], reverse=True)
 
         output_top_k = max(args.final_top_k, 20)
@@ -829,66 +875,3 @@ if __name__ == "__main__":
     main()
     print(f"Total elapsed time: {(time.time() - s) / 60:.2f} minutes")
 
-
-"""
-How to use
-==========
-
-1) Build a vector DB from .json files
-
-python3 hybrid_vectordb_json.py build \
-    --input-dir /storage/data/new_samples \
-    --out-dir /path/to/output_db \
-    --embedding-model Qwen/Qwen3-Embedding-0.6B \
-    --chunk-size 256 \
-    --semantic-threshold 0.85 \
-    --overlap-words 3 \
-    --sentence-chunk-weight 0.5 \
-    --semantic-chunk-weight 0.5 \
-    --nlist 256 \
-    --nprobe 32
-
-Build outputs include models + configuration only:
-- dense_ivfpq.faiss
-- sparse_bm25.pkl
-- manifest.json
-
-2) Search with a query
-
-python3 hybrid_vectordb_json.py search \
-    --db-dir /path/to/output_db \
-    --query "what impacts climate crisis the most?" \
-    --embedding-model Qwen/Qwen3-Embedding-0.6B \
-    --dense-top-k 5 \
-    --sparse-top-k 5 \
-    --final-top-k 5 \
-    --nprobe 32 \
-    --dense-weight 0.5 \
-    --sparse-weight 0.5
-
-Search prints JSON to stdout and also saves:
-- result_{first_three_words}.json (in --db-dir)
-
-3) Search multiple queries continuously
-
-Batch queries from CLI:
-
-python3 hybrid_vectordb.py search \
-    --db-dir /path/to/output_db \
-    --queries "what impacts climate crisis the most?" "what are top mitigation options?" \
-    --embedding-model Qwen/Qwen3-Embedding-0.6B
-
-Batch queries from file (one query per line):
-
-python3 hybrid_vectordb.py search \
-    --db-dir /path/to/output_db \
-    --queries-file /path/to/queries.txt \
-    --embedding-model Qwen/Qwen3-Embedding-0.6B
-
-Interactive continuous mode (type 'exit' to stop):
-
-python3 hybrid_vectordb.py search \
-    --db-dir /path/to/output_db \
-    --interactive \
-    --embedding-model Qwen/Qwen3-Embedding-0.6B
-"""
