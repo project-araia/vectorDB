@@ -4,6 +4,7 @@ import argparse, importlib.machinery, json, logging, math, os, pickle, re, sys, 
 from pathlib import Path
 from typing import Any
 import hashlib
+import torch
 
 import tqdm
 import faiss
@@ -192,7 +193,7 @@ def build_command(args: argparse.Namespace) -> None:
         os.environ["HF_HUB_CACHE"] = str(cache_dir / "hub")
 
     logger.info("Loading embedding model '%s' on device=%s", args.embedding_model, args.device)
-    model = SentenceTransformer(args.embedding_model, device=args.device, cache_folder=args.cache_dir or None)
+    model = SentenceTransformer(args.embedding_model, device=args.device, cache_folder=args.cache_dir or None, model_kwargs={'torch_dtype': torch.float16})
 
     input_files = list_json_files(input_dir)
     logger.info("[1/3] Chunking source .json with weighted sentence+semantic chunking")
@@ -323,7 +324,7 @@ def build_command(args: argparse.Namespace) -> None:
             index.add(embeddings)
             indexed_count += embeddings.shape[0]
 
-    for file_path, _, record in tqdm.tqdm(iterate_json_files(input_files), desc="Processing JSON files"):
+    for file_path, _, record in tqdm.tqdm(iterate_json_files(input_files), desc="Processing JSON files", total=args.max_docs if args.max_docs else None):
         if not isinstance(record, dict):
             continue
         text = extract_text(record)
@@ -536,7 +537,7 @@ def search_command(args: argparse.Namespace) -> None:
         cache_dir.mkdir(parents=True, exist_ok=True)
         os.environ["HF_HOME"] = str(cache_dir)
         os.environ["HF_HUB_CACHE"] = str(cache_dir / "hub")
-    model = SentenceTransformer(args.embedding_model, device=args.device, cache_folder=args.cache_dir or None)
+    model = SentenceTransformer(args.embedding_model, device=args.device, cache_folder=args.cache_dir or None, model_kwargs={'torch_dtype': torch.float16})
 
 
     def run_single_query(query_text: str) -> dict[str, Any]:
