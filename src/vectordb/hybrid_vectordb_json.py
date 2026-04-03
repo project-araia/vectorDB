@@ -7,6 +7,27 @@ from typing import Any
 import faiss
 import numpy as np
 from rank_bm25 import BM25Okapi
+try:
+    import usearch.index as usearch
+except ImportError:
+    usearch = None
+
+from sentence_utils import (
+    extract_text,
+    split_sentences,
+    chunk_by_sentence_window,
+    apply_word_overlap,
+    normalize_chunk_text,
+    tokenize
+)
+
+from json_utils import (
+    iterate_jsonl,
+    list_json_files,
+    iterate_json_files,
+    result_filename_from_query,
+    unique_result_path
+)
 
 os.environ.setdefault("TRANSFORMERS_NO_APEX", "1")
 os.environ.setdefault("TRANSFORMERS_NO_TRAINER", "1")
@@ -35,48 +56,6 @@ def configure_cpu_threads() -> None:
         faiss.omp_set_num_threads(CPU_THREADS)
 
 
-def split_sentences(text: str) -> list[str]:
-    text = text.strip()
-    if not text:
-        return []
-    text = text.replace("\n", " ")
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    return [part.strip() for part in parts if part.strip()]
-
-
-def chunk_by_sentence_window(sentences: list[str], chunk_size: int) -> list[str]:
-    if not sentences:
-        return []
-
-    chunks: list[str] = []
-    start = 0
-    n_sentences = len(sentences)
-
-    while start < n_sentences:
-        end = start
-        current_len = 0
-        while end < n_sentences:
-            sentence = sentences[end]
-            projected = current_len + (1 if current_len else 0) + len(sentence)
-            if projected > chunk_size and end > start:
-                break
-            current_len = projected
-            end += 1
-            if current_len >= chunk_size:
-                break
-
-        chunk = " ".join(sentences[start:end]).strip()
-        if chunk:
-            chunks.append(chunk)
-
-        if end >= n_sentences:
-            break
-
-        start = end
-
-    return chunks
-
-
 def build_semantic_chunks(
     text: str,
     model: SentenceTransformer,
@@ -95,7 +74,7 @@ def build_semantic_chunks(
         sentences,
         normalize_embeddings=True,
         convert_to_numpy=True,
-        show_progress_bar=False,
+        show_progress_bar=True,
         batch_size=min(256, len(sentences)),
     )
     embeddings = np.asarray(embeddings, dtype=np.float32)
@@ -172,110 +151,6 @@ def weighted_merge_chunks(
     return out
 
 
-def tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", text.lower())
-
-def apply_word_overlap(chunks: list[str], overlap_words: int) -> list[str]:
-    overlap_words = max(0, overlap_words)
-    if overlap_words == 0 or len(chunks) < 2:
-        return chunks
-
-    out = [chunks[0]]
-    prev_words = chunks[0].split()
-    for chunk in chunks[1:]:
-        overlap = prev_words[-overlap_words:] if prev_words else []
-        if overlap:
-            curr_words = chunk.split()
-            if len(curr_words) >= overlap_words and curr_words[:overlap_words] == overlap:
-                merged = chunk
-            else:
-                merged = " ".join(overlap + curr_words)
-            chunk = merged
-        out.append(chunk)
-        prev_words = chunk.split()
-    return out
-
-
-def normalize_chunk_text(text: str) -> str:
-    return " ".join(text.lower().split())
-
-def result_filename_from_query(query: str) -> str:
-    words = re.findall(r"[a-z0-9]+", query.lower())
-    first_three = words[:3]
-    if not first_three:
-        return "result_query.json"
-    return f"result_{'_'.join(first_three)}.json"
-
-
-def unique_result_path(db_dir: Path, query: str) -> Path:
-    base_name = result_filename_from_query(query)
-    base_path = db_dir / base_name
-    if not base_path.exists():
-        return base_path
-
-    stem = base_path.stem
-    suffix = base_path.suffix
-    counter = 2
-    while True:
-        candidate = db_dir / f"{stem}_{counter}{suffix}"
-        if not candidate.exists():
-            return candidate
-        counter += 1
-
-
-def iterate_jsonl(path: Path):
-    with path.open("r", encoding="utf-8") as file_obj:
-        for line_number, line in enumerate(file_obj, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield line_number, json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning("Skipping invalid JSON line %s", line_number)
-
-
-def list_json_files(input_dir: Path) -> list[Path]:
-    if not input_dir.exists():
-        raise FileNotFoundError(f"Input dir not found: {input_dir}")
-    files = sorted(input_dir.rglob("*.json"))
-    if not files:
-        raise FileNotFoundError(f"No .json files found under: {input_dir}")
-    return files
-
-
-def iterate_json_files(paths: list[Path]):
-    for path in paths:
-        with path.open("r", encoding="utf-8") as file_obj:
-            try:
-                data = json.load(file_obj)
-            except json.JSONDecodeError:
-                file_obj.seek(0)
-                for line_number, line in enumerate(file_obj, start=1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        yield path, line_number, json.loads(line)
-                    except json.JSONDecodeError:
-                        logger.warning("Skipping invalid JSON line %s in %s", line_number, path)
-                continue
-
-        if isinstance(data, list):
-            for idx, record in enumerate(data, start=1):
-                yield path, idx, record
-        else:
-            yield path, 1, data
-
-
-def extract_text(record: dict[str, Any]) -> str:
-    for key in ("text", "content", "body", "abstract", "introduction", "methodology", "discussion", "conclusion", "summary"):
-        value = record.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
-
-
 def choose_pq_m(dim: int, preferred: int = 64) -> int:
     candidate = min(preferred, dim)
     while candidate > 1:
@@ -332,6 +207,7 @@ def build_command(args: argparse.Namespace) -> None:
     train_blocks: list[np.ndarray] = []
     train_count = 0
     index: faiss.IndexIVFPQ | None = None
+    usearch_index: usearch.Index | None = None
     indexed_count = 0
     token_corpus: list[list[str]] = []
     chunk_texts: list[str] = []
@@ -351,7 +227,7 @@ def build_command(args: argparse.Namespace) -> None:
             batch_size=args.embed_batch_size,
             normalize_embeddings=True,
             convert_to_numpy=True,
-            show_progress_bar=False,
+            show_progress_bar=True,
         )
         embeddings = np.asarray(embeddings, dtype=np.float32)
 
@@ -383,31 +259,44 @@ def build_command(args: argparse.Namespace) -> None:
 
         embeddings = np.asarray(kept_embeddings, dtype=np.float32)
 
-        if index is None:
-            train_blocks.append(embeddings)
-            train_count += embeddings.shape[0]
-            if train_count >= train_target:
-                train_matrix = np.concatenate(train_blocks, axis=0)[:train_target]
-                dim = int(train_matrix.shape[1])
-                pq_m = choose_pq_m(dim, preferred=args.pq_m)
-                quantizer = faiss.IndexFlatIP(dim)
-                index_cpu = faiss.IndexIVFPQ(quantizer, dim, nlist, pq_m, args.nbits, faiss.METRIC_INNER_PRODUCT)
+        if index is None and usearch_index is None:
+            if args.dense_backend == "usearch":
+                if usearch is None:
+                    raise ImportError("usearch package not found. Install it or use --dense-backend faiss")
+                dim = int(embeddings.shape[1])
+                usearch_index = usearch.Index(ndim=dim, metric="ip", dtype="f16")
+                logger.info("Initialized USearch HNSW index dim=%s metric=ip dtype=f16", dim)
+                usearch_index.add(np.arange(indexed_count, indexed_count + embeddings.shape[0]), embeddings)
+                indexed_count += embeddings.shape[0]
+            else:
+                # FAISS Training Logic
+                train_blocks.append(embeddings)
+                train_count += embeddings.shape[0]
+                if train_count >= train_target:
+                    train_matrix = np.concatenate(train_blocks, axis=0)[:train_target]
+                    dim = int(train_matrix.shape[1])
+                    pq_m = choose_pq_m(dim, preferred=args.pq_m)
+                    quantizer = faiss.IndexFlatIP(dim)
+                    index_cpu = faiss.IndexIVFPQ(quantizer, dim, nlist, pq_m, args.nbits, faiss.METRIC_INNER_PRODUCT)
 
-                index_cpu.train(train_matrix)
-                index = index_cpu
-                logger.info(
-                    "Trained IVF-PQ dim=%s nlist=%s m=%s nbits=%s train_vecs=%s",
-                    dim,
-                    nlist,
-                    pq_m,
-                    args.nbits,
-                    f"{train_target:,}",
-                )
+                    index_cpu.train(train_matrix)
+                    index = index_cpu
+                    logger.info(
+                        "Trained IVF-PQ dim=%s nlist=%s m=%s nbits=%s train_vecs=%s",
+                        dim,
+                        nlist,
+                        pq_m,
+                        args.nbits,
+                        f"{train_target:,}",
+                    )
 
-                for block in train_blocks:
-                    index.add(block)
-                    indexed_count += block.shape[0]
-                train_blocks = []
+                    for block in train_blocks:
+                        index.add(block)
+                        indexed_count += block.shape[0]
+                    train_blocks = []
+        elif usearch_index is not None:
+            usearch_index.add(np.arange(indexed_count, indexed_count + embeddings.shape[0]), embeddings)
+            indexed_count += embeddings.shape[0]
         else:
             index.add(embeddings)
             indexed_count += embeddings.shape[0]
@@ -483,32 +372,36 @@ def build_command(args: argparse.Namespace) -> None:
     if batch_items:
         process_batch(batch_items)
 
-    if index is None and train_blocks:
-        train_matrix = np.concatenate(train_blocks, axis=0)
-        dim = int(train_matrix.shape[1])
-        pq_m = choose_pq_m(dim, preferred=args.pq_m)
-        quantizer = faiss.IndexFlatIP(dim)
-        index = faiss.IndexIVFPQ(quantizer, dim, nlist, pq_m, args.nbits, faiss.METRIC_INNER_PRODUCT)
-        index.train(train_matrix)
-        index.add(train_matrix)
-        indexed_count = index.ntotal
-        train_target = int(train_matrix.shape[0])
-        logger.info(
-            "Trained IVF-PQ on available vectors dim=%s nlist=%s m=%s nbits=%s train_vecs=%s",
-            dim,
-            nlist,
-            pq_m,
-            args.nbits,
-            f"{train_target:,}",
-        )
+    if usearch_index is not None:
+        dense_index_path = out_dir / "dense_hnsw.usearch"
+        usearch_index.save(str(dense_index_path))
+        logger.info("Dense index complete (USearch): vectors=%s path=%s", indexed_count, dense_index_path)
+    else:
+        if index is None and train_blocks:
+            train_matrix = np.concatenate(train_blocks, axis=0)
+            dim = int(train_matrix.shape[1])
+            pq_m = choose_pq_m(dim, preferred=args.pq_m)
+            quantizer = faiss.IndexFlatIP(dim)
+            index = faiss.IndexIVFPQ(quantizer, dim, nlist, pq_m, args.nbits, faiss.METRIC_INNER_PRODUCT)
+            index.train(train_matrix)
+            index.add(train_matrix)
+            indexed_count = index.ntotal
+            train_target = int(train_matrix.shape[0])
+            logger.info(
+                "Trained IVF-PQ on available vectors dim=%s nlist=%s m=%s nbits=%s train_vecs=%s",
+                dim,
+                nlist,
+                pq_m,
+                args.nbits,
+                f"{train_target:,}",
+            )
 
-    if index is None:
-        raise RuntimeError("Not enough data to train IVF-PQ index.")
+        if index is None:
+            raise RuntimeError("Not enough data to train IVF-PQ index.")
 
-    index.nprobe = args.nprobe
-    faiss.write_index(index, str(dense_index_path))
-
-    logger.info("Dense index complete: vectors=%s path=%s", f"{index.ntotal:,}", dense_index_path)
+        index.nprobe = args.nprobe
+        faiss.write_index(index, str(dense_index_path))
+        logger.info("Dense index complete (FAISS): vectors=%s path=%s", f"{index.ntotal:,}", dense_index_path)
 
     logger.info("[3/3] Building sparse BM25 index")
     sparse_payload = {
@@ -530,21 +423,22 @@ def build_command(args: argparse.Namespace) -> None:
         "overlap_words": args.overlap_words,
         "sentence_chunk_weight": args.sentence_chunk_weight,
         "semantic_chunk_weight": args.semantic_chunk_weight,
-        "index_type": "IndexIVFPQ",
+        "index_backend": args.dense_backend,
+        "index_type": "IndexIVFPQ" if args.dense_backend == "faiss" else "HNSW",
         "metric": "inner_product",
-        "nlist": args.nlist,
-        "nprobe": args.nprobe,
-        "train_vecs": train_target,
-        "nbits": args.nbits,
+        "nlist": args.nlist if args.dense_backend == "faiss" else None,
+        "nprobe": args.nprobe if args.dense_backend == "faiss" else None,
+        "train_vecs": train_target if args.dense_backend == "faiss" else 0,
+        "nbits": args.nbits if args.dense_backend == "faiss" else None,
         "documents_chunked": source_docs,
         "documents_scanned": scanned_docs,
         "chunks_count": written_chunks,
         "skipped_duplicate_chunks": skipped_duplicates,
-        "dense_vectors": int(index.ntotal),
+        "dense_vectors": int(indexed_count),
         "elapsed_seconds": round(time.time() - t0, 2),
         "max_docs": int(args.max_docs),
         "files": {
-            "dense_faiss": str(dense_index_path),
+            "dense_index": str(dense_index_path),
             "sparse_bm25": str(sparse_index_path),
         },
     }
@@ -585,13 +479,24 @@ def search_command(args: argparse.Namespace) -> None:
     dense_path = db_dir / "dense_ivfpq.faiss"
     sparse_path = db_dir / "sparse_bm25.pkl"
 
-    if not dense_path.exists() or not sparse_path.exists():
-        raise FileNotFoundError("Missing DB files. Expected dense_ivfpq.faiss, sparse_bm25.pkl")
-
     configure_cpu_threads()
 
-    index = faiss.read_index(str(dense_path))
-    index.nprobe = args.nprobe
+    manifest_path = db_dir / "manifest.json"
+    dense_backend = "faiss"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        dense_backend = manifest.get("index_backend", "faiss")
+        dense_path = Path(manifest["files"].get("dense_index", manifest["files"].get("dense_faiss")))
+
+    if dense_backend == "usearch":
+        if usearch is None:
+            raise ImportError("usearch package not found.")
+        index = usearch.Index.restore(str(dense_path))
+        chunk_count_dense = len(index)
+    else:
+        index = faiss.read_index(str(dense_path))
+        index.nprobe = args.nprobe
+        chunk_count_dense = int(index.ntotal)
 
     with sparse_path.open("rb") as file_obj:
         sparse_payload = pickle.load(file_obj)
@@ -600,7 +505,7 @@ def search_command(args: argparse.Namespace) -> None:
     chunk_texts = sparse_payload.get("chunk_texts", []) if isinstance(sparse_payload, dict) else []
     chunk_metadata = sparse_payload.get("chunk_metadata", []) if isinstance(sparse_payload, dict) else []
     bm25 = BM25Okapi(token_corpus)
-    chunk_count = min(int(index.ntotal), len(token_corpus), len(chunk_texts), len(chunk_metadata))
+    chunk_count = min(chunk_count_dense, len(token_corpus), len(chunk_texts), len(chunk_metadata))
     if chunk_count == 0:
         raise RuntimeError("Empty index or token corpus. Rebuild the DB.")
 
@@ -626,9 +531,14 @@ def search_command(args: argparse.Namespace) -> None:
         )
         query_vec = np.asarray(query_vec, dtype=np.float32)
 
-        dense_scores_arr, dense_ids_arr = index.search(query_vec, args.dense_top_k)
-        dense_scores_arr = dense_scores_arr[0]
-        dense_ids_arr = dense_ids_arr[0]
+        if dense_backend == "usearch":
+            matches = index.search(query_vec, args.dense_top_k)
+            dense_ids_arr = matches.labels[0]
+            dense_scores_arr = matches.distances[0]
+        else:
+            dense_scores_arr, dense_ids_arr = index.search(query_vec, args.dense_top_k)
+            dense_scores_arr = dense_scores_arr[0]
+            dense_ids_arr = dense_ids_arr[0]
 
         sparse_scores_arr = bm25.get_scores(tokenize(query_text))
         sparse_ids = np.argsort(sparse_scores_arr)[::-1][: args.sparse_top_k]
@@ -757,8 +667,9 @@ def parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     build = subparsers.add_parser("build", help="Build chunked corpus + dense/sparse indexes")
-    build.add_argument("--input-dir", type=str, default="/storage/data/new_samples")
+    build.add_argument("--input-dir", type=str, default=Path.home() / "data/new_samples")
     build.add_argument("--out-dir", type=str, required=True)
+    build.add_argument("--dense-backend", type=str, choices=["faiss", "usearch"], default="faiss")
     build.add_argument("--embedding-model", type=str, default="Qwen/Qwen3-Embedding-0.6B")
     build.add_argument("--chunk-size", type=int, default=256)
     build.add_argument("--overlap-words", type=int, default=3)
@@ -772,10 +683,11 @@ def parse_args() -> argparse.Namespace:
     build.add_argument("--nbits", type=int, default=8)
     build.add_argument("--train-vecs", type=int, default=20000)
     build.add_argument("--max-docs", type=int, default=0)
-    build.add_argument("--cache-dir", type=str, default="/storage/.cache/huggingface")
+    build.add_argument("--cache-dir", type=str, default=Path.home()/".cache/huggingface")
 
     search = subparsers.add_parser("search", help="Search built DB and return top fused chunks")
     search.add_argument("--db-dir", type=str, required=True)
+    search.add_argument("--dense-backend", type=str, choices=["faiss", "usearch"], default="faiss")
     search.add_argument("--query", type=str, default="")
     search.add_argument("--queries", type=str, nargs="+")
     search.add_argument("--queries-file", type=str, default="")
@@ -787,7 +699,7 @@ def parse_args() -> argparse.Namespace:
     search.add_argument("--nprobe", type=int, default=32)
     search.add_argument("--dense-weight", type=float, default=0.5)
     search.add_argument("--sparse-weight", type=float, default=0.5)
-    search.add_argument("--cache-dir", type=str, default="/storage/.cache/huggingface")
+    search.add_argument("--cache-dir", type=str, default=Path.home()/".cache/huggingface")
 
     return parser.parse_args()
 
