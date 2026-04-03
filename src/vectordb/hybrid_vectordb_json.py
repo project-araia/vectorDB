@@ -3,7 +3,9 @@
 import argparse, importlib.machinery, json, logging, math, os, pickle, re, sys, time, types
 from pathlib import Path
 from typing import Any
+import hashlib
 
+import tqdm
 import faiss
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -74,7 +76,7 @@ def build_semantic_chunks(
         sentences,
         normalize_embeddings=True,
         convert_to_numpy=True,
-        show_progress_bar=True,
+        show_progress_bar=False,
         batch_size=min(256, len(sentences)),
     )
     embeddings = np.asarray(embeddings, dtype=np.float32)
@@ -189,8 +191,8 @@ def build_command(args: argparse.Namespace) -> None:
         os.environ["HF_HOME"] = str(cache_dir)
         os.environ["HF_HUB_CACHE"] = str(cache_dir / "hub")
 
-    logger.info("Loading embedding model '%s' on device=cpu", args.embedding_model)
-    model = SentenceTransformer(args.embedding_model, device="cpu", cache_folder=args.cache_dir or None)
+    logger.info("Loading embedding model '%s' on device=%s", args.embedding_model, args.device)
+    model = SentenceTransformer(args.embedding_model, device=args.device, cache_folder=args.cache_dir or None)
 
     input_files = list_json_files(input_dir)
     logger.info("[1/3] Chunking source .json with weighted sentence+semantic chunking")
@@ -218,7 +220,7 @@ def build_command(args: argparse.Namespace) -> None:
     batch_items: list[tuple[str, dict[str, Any]]] = []
 
     def process_batch(items: list[tuple[str, dict[str, Any]]]) -> None:
-        nonlocal train_count, train_blocks, index, indexed_count, dedup_index, skipped_duplicates, written_chunks
+        nonlocal train_count, train_blocks, index, usearch_index, indexed_count, dedup_index, skipped_duplicates, written_chunks
         if not items:
             return
         texts = [text for text, _ in items]
@@ -227,37 +229,57 @@ def build_command(args: argparse.Namespace) -> None:
             batch_size=args.embed_batch_size,
             normalize_embeddings=True,
             convert_to_numpy=True,
-            show_progress_bar=True,
+            show_progress_bar=False,
         )
         embeddings = np.asarray(embeddings, dtype=np.float32)
-
-        kept_embeddings: list[np.ndarray] = []
-        for (chunk_text, metadata), embedding in zip(items, embeddings):
+        
+        # 1. String-based deduplication using memory-efficient hashes
+        valid_indices = []
+        for i, (chunk_text, _) in enumerate(items):
             normalized = normalize_chunk_text(chunk_text)
-            if normalized in seen_chunks:
+            text_hash = hashlib.md5(normalized.encode('utf-8')).hexdigest()
+            if text_hash in seen_chunks:
                 skipped_duplicates += 1
                 continue
+            seen_chunks.add(text_hash)
+            valid_indices.append(i)
 
-            if dedup_index is None:
-                dedup_index = faiss.IndexFlatIP(int(embedding.shape[0]))
-            elif dedup_index.ntotal > 0:
-                scores, _ = dedup_index.search(embedding[None, :], 1)
-                if float(scores[0][0]) >= EMBEDDING_DEDUP_THRESHOLD:
+        if not valid_indices:
+            return
+
+        # 2. Semantic deduplication using batched FAISS search
+        filtered_embeddings = embeddings[valid_indices]
+        
+        if dedup_index is None:
+            dedup_index = faiss.IndexFlatIP(int(filtered_embeddings.shape[1]))
+            
+        semantic_valid_indices = []
+        if dedup_index.ntotal > 0:
+            scores, _ = dedup_index.search(filtered_embeddings, 1)
+            for j, i in enumerate(valid_indices):
+                if float(scores[j][0]) >= EMBEDDING_DEDUP_THRESHOLD:
                     skipped_duplicates += 1
-                    continue
+                else:
+                    semantic_valid_indices.append(i)
+        else:
+            semantic_valid_indices = valid_indices
 
-            seen_chunks.add(normalized)
-            dedup_index.add(embedding[None, :])
+        if not semantic_valid_indices:
+            return
+
+        # 3. Add to the FAISS dedup index in a single batched operation
+        kept_embeddings_arr = embeddings[semantic_valid_indices]
+        dedup_index.add(kept_embeddings_arr)
+
+        # 4. Finalize kept texts and tokens
+        for i in semantic_valid_indices:
+            chunk_text, metadata = items[i]
             token_corpus.append(tokenize(chunk_text))
             chunk_texts.append(chunk_text)
             chunk_metadata.append(metadata)
-            kept_embeddings.append(embedding)
             written_chunks += 1
 
-        if not kept_embeddings:
-            return
-
-        embeddings = np.asarray(kept_embeddings, dtype=np.float32)
+        embeddings = kept_embeddings_arr
 
         if index is None and usearch_index is None:
             if args.dense_backend == "usearch":
@@ -301,7 +323,7 @@ def build_command(args: argparse.Namespace) -> None:
             index.add(embeddings)
             indexed_count += embeddings.shape[0]
 
-    for file_path, _, record in iterate_json_files(input_files):
+    for file_path, _, record in tqdm.tqdm(iterate_json_files(input_files), desc="Processing JSON files"):
         if not isinstance(record, dict):
             continue
         text = extract_text(record)
@@ -514,7 +536,7 @@ def search_command(args: argparse.Namespace) -> None:
         cache_dir.mkdir(parents=True, exist_ok=True)
         os.environ["HF_HOME"] = str(cache_dir)
         os.environ["HF_HUB_CACHE"] = str(cache_dir / "hub")
-    model = SentenceTransformer(args.embedding_model, device="cpu", cache_folder=args.cache_dir or None)
+    model = SentenceTransformer(args.embedding_model, device=args.device, cache_folder=args.cache_dir or None)
 
 
     def run_single_query(query_text: str) -> dict[str, Any]:
@@ -670,6 +692,7 @@ def parse_args() -> argparse.Namespace:
     build.add_argument("--input-dir", type=str, default=Path.home() / "data/new_samples")
     build.add_argument("--out-dir", type=str, required=True)
     build.add_argument("--dense-backend", type=str, choices=["faiss", "usearch"], default="faiss")
+    build.add_argument("--device", type=str, default="cpu", help="Device for embedding model (e.g., cpu, cuda, mps)")
     build.add_argument("--embedding-model", type=str, default="Qwen/Qwen3-Embedding-0.6B")
     build.add_argument("--chunk-size", type=int, default=256)
     build.add_argument("--overlap-words", type=int, default=3)
@@ -688,6 +711,7 @@ def parse_args() -> argparse.Namespace:
     search = subparsers.add_parser("search", help="Search built DB and return top fused chunks")
     search.add_argument("--db-dir", type=str, required=True)
     search.add_argument("--dense-backend", type=str, choices=["faiss", "usearch"], default="faiss")
+    search.add_argument("--device", type=str, default="cpu", help="Device for embedding model (e.g., cpu, cuda, mps)")
     search.add_argument("--query", type=str, default="")
     search.add_argument("--queries", type=str, nargs="+")
     search.add_argument("--queries-file", type=str, default="")

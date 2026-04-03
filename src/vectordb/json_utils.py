@@ -26,7 +26,7 @@ def list_json_files(input_dir: Path) -> list[Path]:
         raise FileNotFoundError(f"Input dir not found: {input_dir}")
 
     # Using rglob to recursively find files in all subdirectories (shards)
-    # We look for both .json and .jsonl as sharded datasets often use both
+    # We look for both .json and .jsonl as sharded datasets may use either.
     json_files = list(input_dir.rglob("*.json"))
     jsonl_files = list(input_dir.rglob("*.jsonl"))
 
